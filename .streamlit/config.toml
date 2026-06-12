@@ -1,0 +1,7 @@
+[server]
+# Allow huge files (MB). Raise if you need more.
+maxUploadSize = 2048
+headless = true
+
+[browser]
+gatherUsageStats = false

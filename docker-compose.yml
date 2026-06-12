@@ -1,0 +1,15 @@
+services:
+  office2md:
+    build: .
+    container_name: office2md
+    ports:
+      - "8501:8501"
+    environment:
+      # Pre-fill the vision LLM settings (optional). Examples:
+      #   LLM_BASE_URL: "http://192.168.1.50:11434/v1"   # Ollama on your PC
+      #   LLM_MODEL: "qwen2.5vl:7b"
+      #   LLM_API_KEY: "ollama"
+      LLM_BASE_URL: "${LLM_BASE_URL:-}"
+      LLM_MODEL: "${LLM_MODEL:-}"
+      LLM_API_KEY: "${LLM_API_KEY:-}"
+    restart: unless-stopped
