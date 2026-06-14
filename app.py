@@ -31,6 +31,44 @@ SCREENSHOT_PROMPT = (
 st.set_page_config(page_title="Office2MD", page_icon="📝", layout="wide")
 
 
+# ------------------------------------------------------ ollama detection ---
+def ollama_native_root(base_url: str) -> str:
+    """Turn an OpenAI-compatible base URL into Ollama's native API root.
+
+    e.g. http://localhost:11434/v1 -> http://localhost:11434
+    """
+    root = base_url.strip().rstrip("/")
+    if root.endswith("/v1"):
+        root = root[: -len("/v1")]
+    return root.rstrip("/")
+
+
+@st.cache_data(show_spinner=False, ttl=300)
+def list_ollama_vision_models(base_url: str) -> list[str]:
+    """Return installed Ollama models that advertise the 'vision' capability.
+
+    Raises on connection failure so the caller can fall back to manual entry.
+    """
+    import requests
+
+    root = ollama_native_root(base_url)
+    tags = requests.get(f"{root}/api/tags", timeout=4).json()
+    vision: list[str] = []
+    for m in tags.get("models", []):
+        name = m.get("name")
+        if not name:
+            continue
+        try:
+            info = requests.post(
+                f"{root}/api/show", json={"model": name}, timeout=6
+            ).json()
+        except Exception:
+            continue  # skip a model we can't introspect
+        if "vision" in (info.get("capabilities") or []):
+            vision.append(name)
+    return sorted(vision)
+
+
 # ---------------------------------------------------------------- sidebar ---
 st.sidebar.title("📝 Office2MD")
 st.sidebar.caption("Documents → Markdown via Microsoft markitdown")
@@ -48,12 +86,41 @@ llm_base_url = st.sidebar.text_input(
     help="Ollama default: http://localhost:11434/v1 — from Docker on another "
     "machine, use that machine's LAN/Tailscale IP.",
 )
-llm_model = st.sidebar.text_input(
-    "Vision model",
-    value=os.environ.get("LLM_MODEL", "qwen2.5vl:7b"),
-    disabled=not llm_enabled,
-    help="Must be a vision-capable model, e.g. qwen2.5vl:7b, llava, gpt-4o-mini.",
-)
+if llm_enabled and st.sidebar.button("🔄 Detect vision models from Ollama"):
+    list_ollama_vision_models.clear()  # bust the cache, re-query
+
+default_model = os.environ.get("LLM_MODEL", "")
+detected: list[str] = []
+detect_error: str | None = None
+if llm_enabled:
+    try:
+        detected = list_ollama_vision_models(llm_base_url)
+    except Exception as exc:
+        detect_error = str(exc)
+
+if detected:
+    # keep an env-provided default selected if it's actually vision-capable
+    index = detected.index(default_model) if default_model in detected else 0
+    llm_model = st.sidebar.selectbox(
+        "Vision model (auto-detected)",
+        detected,
+        index=index,
+        disabled=not llm_enabled,
+        help="Only Ollama models reporting the 'vision' capability are listed.",
+    )
+else:
+    if llm_enabled and detect_error:
+        st.sidebar.caption(
+            "⚠️ Couldn't auto-detect from Ollama "
+            f"({detect_error}). Type the model name, or use an OpenAI model."
+        )
+    llm_model = st.sidebar.text_input(
+        "Vision model",
+        value=default_model or "qwen2.5vl:7b",
+        disabled=not llm_enabled,
+        help="Vision-capable model, e.g. qwen2.5vl:7b, llava, gpt-4o-mini.",
+    )
+
 llm_api_key = st.sidebar.text_input(
     "API key",
     value=os.environ.get("LLM_API_KEY", "ollama"),
