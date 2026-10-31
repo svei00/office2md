@@ -3,6 +3,17 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
+# Optional: LibreOffice for legacy .doc/.ppt and OpenDocument/RTF files.
+# Adds several hundred MB, so it's off by default:
+#   docker compose build --build-arg WITH_LIBREOFFICE=1
+ARG WITH_LIBREOFFICE=0
+RUN if [ "$WITH_LIBREOFFICE" = "1" ]; then \
+        apt-get update && \
+        apt-get install -y --no-install-recommends \
+            libreoffice-writer libreoffice-impress libreoffice-calc && \
+        rm -rf /var/lib/apt/lists/*; \
+    fi
+
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 

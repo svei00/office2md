@@ -7,6 +7,9 @@ LLM (Ollama or any OpenAI-compatible endpoint) when one is configured.
 
 import io
 import os
+import re
+import shutil
+import subprocess
 import tempfile
 import zipfile
 from pathlib import Path
@@ -14,11 +17,25 @@ from pathlib import Path
 import streamlit as st
 from markitdown import MarkItDown
 
+from sheets import LeanSheetConverter
+
 DOCUMENT_TYPES = [
-    "docx", "doc", "pptx", "ppt", "xlsx", "xls", "pdf",
+    "docx", "pptx", "xlsx", "xlsm", "xls", "pdf",
     "csv", "json", "xml", "html", "htm", "epub", "msg", "zip", "txt",
 ]
 IMAGE_TYPES = ["png", "jpg", "jpeg"]
+# formats markitdown can't read; LibreOffice (if installed) upgrades them first
+LEGACY_UPGRADE = {
+    ".doc": "docx", ".rtf": "docx", ".odt": "docx",
+    ".ppt": "pptx", ".odp": "pptx",
+    ".ods": "xlsx",
+}
+SHEET_MODES = {
+    "Auto (recommended)": "auto",
+    "Markdown table": "table",
+    "Cell list (A1: value)": "cells",
+    "CSV": "csv",
+}
 
 SCREENSHOT_PROMPT = (
     "Transcribe this screenshot into Markdown. Extract ALL visible text exactly "
@@ -69,9 +86,54 @@ def list_ollama_vision_models(base_url: str) -> list[str]:
     return sorted(vision)
 
 
+def find_soffice() -> str | None:
+    """LibreOffice binary: on PATH, or the default Windows install location."""
+    found = shutil.which("soffice") or shutil.which("libreoffice")
+    if found:
+        return found
+    win = Path(os.environ.get("PROGRAMFILES", r"C:\Program Files"))
+    candidate = win / "LibreOffice" / "program" / "soffice.exe"
+    return str(candidate) if candidate.exists() else None
+
+
+SOFFICE = find_soffice()
+
+
 # ---------------------------------------------------------------- sidebar ---
 st.sidebar.title("📝 Office2MD")
 st.sidebar.caption("Documents → Markdown via Microsoft markitdown")
+
+st.sidebar.subheader("Token-lean output")
+sheet_mode = SHEET_MODES[
+    st.sidebar.selectbox(
+        "Excel / CSV layout",
+        list(SHEET_MODES),
+        help="Auto: title/form cells as 'A1: value' lines, data blocks as a "
+        "compact table. Cell list suits forms and invoices; CSV is the "
+        "densest for big data tables.",
+    )
+]
+sheet_formulas = st.sidebar.checkbox(
+    "Show Excel formulas next to values",
+    help="e.g. '150 (=B8*C8)'. Formulas with no saved value are always shown.",
+)
+sheet_max_rows = st.sidebar.number_input(
+    "Max data rows per sheet (0 = all)",
+    min_value=0,
+    value=0,
+    step=50,
+    help="Cap huge sheets when the AI only needs the structure and a sample.",
+)
+compact = st.sidebar.checkbox(
+    "Compact Markdown",
+    value=True,
+    help="Strip table padding, blank-line runs and embedded-image stubs.",
+)
+if not SOFFICE:
+    st.sidebar.caption(
+        "Install LibreOffice to also convert legacy .doc/.ppt and "
+        "OpenDocument/RTF files."
+    )
 
 st.sidebar.subheader("Image transcription (vision LLM)")
 llm_enabled = st.sidebar.toggle(
@@ -147,21 +209,91 @@ def build_llm_kwargs() -> dict:
 # ------------------------------------------------------------- conversion ---
 @st.cache_resource
 def get_converter() -> MarkItDown:
-    return MarkItDown(enable_plugins=False)
+    md = MarkItDown(enable_plugins=False)
+    md.register_converter(LeanSheetConverter())  # replaces the NaN-padded tables
+    return md
 
 
-def convert_upload(uploaded_file, llm_kwargs: dict) -> str:
+def convert_kwargs() -> dict:
+    """All per-run options passed through markitdown to the converters."""
+    return {
+        **build_llm_kwargs(),
+        "sheet_mode": sheet_mode,
+        "sheet_formulas": sheet_formulas,
+        "sheet_max_rows": sheet_max_rows,
+    }
+
+
+def compact_markdown(text: str) -> str:
+    """Drop formatting that costs tokens but carries no content."""
+    out: list[str] = []
+    in_fence = False
+    for line in text.splitlines():
+        line = line.rstrip()
+        if line.startswith("```"):
+            in_fence = not in_fence
+        elif not in_fence and line.startswith("|") and line.endswith("|"):
+            line = "|" + "|".join(c.strip() for c in line[1:-1].split("|")) + "|"
+            if re.fullmatch(r"\|(?::?-+:?\|)+", line):
+                line = re.sub(r"-+", "---", line)
+            # markitdown emits an empty header row for header-less tables:
+            # promote the first data row instead
+            if (
+                len(out) >= 2
+                and re.fullmatch(r"\|+", out[-2])
+                and re.fullmatch(r"\|(?:-+\|)+", out[-1])
+            ):
+                out[-2] = line
+                continue
+        out.append(line)
+    text = "\n".join(out)
+    text = re.sub(r"!\[([^\]]*)\]\(data:[^)]*\)", r"[image \1]", text)
+    text = re.sub(r"\[image \]", "[image]", text)
+    return re.sub(r"\n{3,}", "\n\n", text).strip() + "\n"
+
+
+def upgrade_legacy(path: Path, workdir: Path) -> Path:
+    """Convert .doc/.ppt/ODF/RTF to the modern format with LibreOffice."""
+    target = LEGACY_UPGRADE[path.suffix.lower()]
+    if not SOFFICE:
+        raise RuntimeError(
+            f"{path.suffix} needs LibreOffice installed to convert it "
+            f"(or re-save the file as .{target})."
+        )
+    subprocess.run(
+        [
+            SOFFICE,
+            "--headless",
+            # private profile, so parallel runs don't fight over the user's one
+            f"-env:UserInstallation={(workdir / 'lo-profile').as_uri()}",
+            "--convert-to", target,
+            "--outdir", str(workdir),
+            str(path),
+        ],
+        check=True,
+        capture_output=True,
+        timeout=300,
+    )
+    out = workdir / f"{path.stem}.{target}"
+    if not out.exists():
+        raise RuntimeError(f"LibreOffice could not convert {path.name}")
+    return out
+
+
+def convert_upload(uploaded_file, kwargs: dict) -> str:
     """Convert one uploaded file to Markdown text."""
-    suffix = Path(uploaded_file.name).suffix
-    # markitdown infers the format from the extension, so keep it on the temp file
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        tmp.write(uploaded_file.getbuffer())
-        tmp_path = tmp.name
-    try:
-        result = get_converter().convert(tmp_path, **llm_kwargs)
-        return result.text_content
-    finally:
-        os.unlink(tmp_path)
+    with tempfile.TemporaryDirectory() as tmp:
+        # markitdown infers the format from the extension, so keep the name
+        path = Path(tmp) / Path(uploaded_file.name).name
+        path.write_bytes(uploaded_file.getbuffer())
+        if path.suffix.lower() in LEGACY_UPGRADE:
+            path = upgrade_legacy(path, Path(tmp))
+        text = get_converter().convert(str(path), **kwargs).text_content
+    return compact_markdown(text) if compact else text
+
+
+def token_estimate(text: str) -> str:
+    return f"≈{len(text) // 4:,} tokens"
 
 
 # -------------------------------------------------------------------- UI ----
@@ -169,6 +301,8 @@ tab_files, tab_url = st.tabs(["📁 Files", "🔗 URL"])
 
 with tab_files:
     accepted = DOCUMENT_TYPES + (IMAGE_TYPES if llm_enabled else [])
+    if SOFFICE:
+        accepted += [ext.lstrip(".") for ext in LEGACY_UPGRADE]
     if not llm_enabled:
         st.info(
             "Images (PNG/JPG) are hidden because transcription is off — a bare "
@@ -184,21 +318,29 @@ with tab_files:
 
     if uploads and st.button("Convert to Markdown", type="primary"):
         results: dict[str, str] = {}
-        llm_kwargs = build_llm_kwargs()
+        kwargs = convert_kwargs()
         progress = st.progress(0.0)
         for i, up in enumerate(uploads):
             with st.spinner(f"Converting {up.name}…"):
                 try:
-                    results[up.name] = convert_upload(up, llm_kwargs)
+                    results[up.name] = convert_upload(up, kwargs)
                 except Exception as exc:  # surface per-file errors, keep going
                     st.error(f"**{up.name}** failed: {exc}")
             progress.progress((i + 1) / len(uploads))
         progress.empty()
         st.session_state["results"] = results
 
-    for name, text in st.session_state.get("results", {}).items():
-        md_name = f"{Path(name).stem}.md"
-        with st.expander(f"✅ {name} → {md_name}", expanded=len(uploads or []) == 1):
+    results = st.session_state.get("results", {})
+    stems = [Path(n).stem for n in results]
+    # "report.docx" + "report.xlsx" would both become report.md in the ZIP
+    md_names = {
+        n: f"{Path(n).stem}.md" if stems.count(Path(n).stem) == 1 else f"{n}.md"
+        for n in results
+    }
+    for name, text in results.items():
+        md_name = md_names[name]
+        label = f"✅ {name} → {md_name} ({token_estimate(text)})"
+        with st.expander(label, expanded=len(uploads or []) == 1):
             st.download_button(
                 f"⬇️ Download {md_name}",
                 text,
@@ -208,12 +350,11 @@ with tab_files:
             )
             st.code(text, language="markdown")
 
-    results = st.session_state.get("results", {})
     if len(results) > 1:
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
             for name, text in results.items():
-                zf.writestr(f"{Path(name).stem}.md", text)
+                zf.writestr(md_names[name], text)
         st.download_button(
             "⬇️ Download all as ZIP",
             buf.getvalue(),
@@ -226,13 +367,15 @@ with tab_url:
     if url and st.button("Convert URL"):
         with st.spinner("Fetching and converting…"):
             try:
-                result = get_converter().convert(url, **build_llm_kwargs())
+                text = get_converter().convert(url, **convert_kwargs()).text_content
+                if compact:
+                    text = compact_markdown(text)
                 st.download_button(
-                    "⬇️ Download Markdown",
-                    result.text_content,
+                    f"⬇️ Download Markdown ({token_estimate(text)})",
+                    text,
                     file_name="page.md",
                     mime="text/markdown",
                 )
-                st.code(result.text_content, language="markdown")
+                st.code(text, language="markdown")
             except Exception as exc:
                 st.error(f"Conversion failed: {exc}")

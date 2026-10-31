@@ -1,3 +1,4 @@
 streamlit>=1.40
-markitdown[docx,pptx,xlsx,xls,pdf,epub,outlook]>=0.1.6
+markitdown[docx,pptx,xlsx,xls,pdf,outlook]>=0.1.6
 openai>=1.50
+requests>=2.31
